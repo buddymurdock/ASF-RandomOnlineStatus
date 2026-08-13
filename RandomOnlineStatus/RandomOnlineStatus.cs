@@ -17,9 +17,11 @@ namespace RandomOnlineStatus;
 #pragma warning disable CA5394 // Randomness here only picks an arbitrary state/delay/game, it's not used for anything security-sensitive
 [UsedImplicitly]
 internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUpdates {
-	private const ushort DefaultMaxDelayInMinutes = 240;
-	private const ushort DefaultMinDelayInMinutes = 30;
+	private const ushort DefaultMaxDelayInMinutes = 480;
+	private const ushort DefaultMinDelayInMinutes = 120;
 	private const ushort DefaultOwnedGamesCacheHours = 24;
+	private const ushort DefaultSubStateMaxDelayInMinutes = 90;
+	private const ushort DefaultSubStateMinDelayInMinutes = 15;
 
 	// Weights match a rough "human" daily pattern: mostly offline, and while online, mostly playing one particular game rather than idly browsing or trying something else
 	private const double OfflineWeight = 0.70;
@@ -41,12 +43,15 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 	private ushort MaxDelayInMinutes = DefaultMaxDelayInMinutes;
 	private ushort MinDelayInMinutes = DefaultMinDelayInMinutes;
 	private ushort OwnedGamesCacheHours = DefaultOwnedGamesCacheHours;
+	private ushort SubStateMaxDelayInMinutes = DefaultSubStateMaxDelayInMinutes;
+	private ushort SubStateMinDelayInMinutes = DefaultSubStateMinDelayInMinutes;
 
 	public string Name => nameof(RandomOnlineStatus);
 	public string RepositoryName => "buddymurdock/ASF-RandomOnlineStatus";
 	public Version Version => typeof(RandomOnlineStatus).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
-	// Reads RandomOnlineStatusEnabled / RandomOnlineStatusMinDelayMinutes / RandomOnlineStatusMaxDelayMinutes / RandomOnlineStatusMainGameAppIDs / RandomOnlineStatusOwnedGamesCacheHours from the global ASF.json config
+	// Reads RandomOnlineStatusEnabled / RandomOnlineStatusMinDelayMinutes / RandomOnlineStatusMaxDelayMinutes / RandomOnlineStatusSubStateMinDelayMinutes /
+	// RandomOnlineStatusSubStateMaxDelayMinutes / RandomOnlineStatusMainGameAppIDs / RandomOnlineStatusOwnedGamesCacheHours from the global ASF.json config
 	public Task OnASFInit(IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
 		if (additionalConfigProperties != null) {
 			foreach ((string configProperty, JsonElement configValue) in additionalConfigProperties) {
@@ -65,6 +70,14 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 						break;
 					case $"{nameof(RandomOnlineStatus)}OwnedGamesCacheHours" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort cacheHours) && (cacheHours > 0):
 						OwnedGamesCacheHours = cacheHours;
+
+						break;
+					case $"{nameof(RandomOnlineStatus)}SubStateMinDelayMinutes" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort subStateMinDelay) && (subStateMinDelay > 0):
+						SubStateMinDelayInMinutes = subStateMinDelay;
+
+						break;
+					case $"{nameof(RandomOnlineStatus)}SubStateMaxDelayMinutes" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort subStateMaxDelay) && (subStateMaxDelay > 0):
+						SubStateMaxDelayInMinutes = subStateMaxDelay;
 
 						break;
 					case $"{nameof(RandomOnlineStatus)}MainGameAppIDs" when configValue.ValueKind == JsonValueKind.Array:
@@ -89,6 +102,10 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 			(MinDelayInMinutes, MaxDelayInMinutes) = (MaxDelayInMinutes, MinDelayInMinutes);
 		}
 
+		if (SubStateMinDelayInMinutes > SubStateMaxDelayInMinutes) {
+			(SubStateMinDelayInMinutes, SubStateMaxDelayInMinutes) = (SubStateMaxDelayInMinutes, SubStateMinDelayInMinutes);
+		}
+
 		if (!Enabled) {
 			ASF.ArchiLogger.LogGenericInfo($"{Name} is disabled, set {nameof(RandomOnlineStatus)}Enabled to true in ASF.json to turn it on.");
 
@@ -99,7 +116,7 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 			ASF.ArchiLogger.LogGenericWarning($"{nameof(RandomOnlineStatus)}MainGameAppIDs is empty; the 'main game' state will always fall back to no game.");
 		}
 
-		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, every {MinDelayInMinutes}-{MaxDelayInMinutes} minutes each bot randomly rolls: {OfflineWeight:P0} invisible, {(1 - OfflineWeight) * MainGameWeight:P0} online in a main game, {(1 - OfflineWeight) * IdleWeight:P0} online with no game, {(1 - OfflineWeight) * (1 - MainGameWeight - IdleWeight):P0} online in a random owned game.");
+		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, every {MinDelayInMinutes}-{MaxDelayInMinutes} minutes each bot rolls a new offline/online block ({OfflineWeight:P0} offline), and while online re-rolls what it's doing every {SubStateMinDelayInMinutes}-{SubStateMaxDelayInMinutes} minutes: {MainGameWeight:P0} main game, {IdleWeight:P0} no game, {1 - MainGameWeight - IdleWeight:P0} random owned game.");
 
 		return Task.CompletedTask;
 	}
@@ -116,7 +133,11 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 			cts.Dispose();
 		}
 
-		// The connection is already gone, so there's nothing left to Resume() towards; just clear the flag so we don't try later
+		// Resume() is a no-op if CardsFarmer isn't paused, so it's safe to call unconditionally here. Without this, a bot that disconnects
+		// while we're mid-simulated-play would reconnect with CardsFarmer left permanently paused (BotSimulatingPlay reset below means
+		// nothing else would ever call Resume() for it again) and silently never farm cards until manually unpaused
+		_ = bot.Actions.Resume();
+
 		BotSimulatingPlay[bot.BotName] = false;
 	}
 
@@ -139,31 +160,70 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 		return Task.CompletedTask;
 	}
 
+	// Two timing tiers, matching how a real person's day is structured: long offline/online blocks (hours), and within an online
+	// block, shorter-lived changes to what's actually happening (minutes). Re-rolling offline-vs-online on the same short cadence
+	// as "what game" would make the bot flicker its visibility every 30-240 minutes, which reads as far more robotic than a human
+	// who's simply asleep or at work for a stretch. Block duration is drawn from the same range regardless of offline/online, so
+	// the 70/30 time split falls out of the OfflineWeight roll alone and isn't skewed by this two-tier structure.
 	private async Task BotStatusLoopAsync(Bot bot, CancellationToken cancellationToken) {
 		while (!cancellationToken.IsCancellationRequested) {
-			int delayMinutes = MinDelayInMinutes == MaxDelayInMinutes ? MinDelayInMinutes : Random.Shared.Next(MinDelayInMinutes, MaxDelayInMinutes + 1);
+			int blockMinutes = MinDelayInMinutes == MaxDelayInMinutes ? MinDelayInMinutes : Random.Shared.Next(MinDelayInMinutes, MaxDelayInMinutes + 1);
+			DateTime blockEnd = DateTime.UtcNow.AddMinutes(blockMinutes);
 
-			try {
-				await Task.Delay(TimeSpan.FromMinutes(delayMinutes), cancellationToken).ConfigureAwait(false);
-			} catch (OperationCanceledException) {
-				break;
+			if (RollOffline()) {
+				bot.SteamFriends.SetPersonaState(EPersonaState.Invisible);
+				StopSimulatedPlay(bot);
+
+				bot.ArchiLogger.LogGenericInfo($"Randomly went invisible (simulating offline) for ~{blockMinutes} minutes.");
+
+				if (!await DelayUntilAsync(blockEnd, cancellationToken).ConfigureAwait(false)) {
+					break;
+				}
+			} else {
+				bot.ArchiLogger.LogGenericInfo($"Randomly came online for ~{blockMinutes} minutes.");
+
+				while ((DateTime.UtcNow < blockEnd) && !cancellationToken.IsCancellationRequested) {
+					try {
+						await ApplyOnlineSubStateAsync(bot).ConfigureAwait(false);
+					} catch (Exception e) {
+						ASF.ArchiLogger.LogGenericException(e);
+					}
+
+					int subStateMinutes = SubStateMinDelayInMinutes == SubStateMaxDelayInMinutes ? SubStateMinDelayInMinutes : Random.Shared.Next(SubStateMinDelayInMinutes, SubStateMaxDelayInMinutes + 1);
+					DateTime nextSubStateAt = DateTime.UtcNow.AddMinutes(subStateMinutes);
+					DateTime waitUntil = nextSubStateAt < blockEnd ? nextSubStateAt : blockEnd;
+
+					if (!await DelayUntilAsync(waitUntil, cancellationToken).ConfigureAwait(false)) {
+						break;
+					}
+				}
+
+				// Always hand control back to CardsFarmer at the end of an online block; if the next block is online too, it'll pick a fresh sub-state right away
+				StopSimulatedPlay(bot);
 			}
 
-			if (cancellationToken.IsCancellationRequested || !bot.IsConnectedAndLoggedOn) {
+			if (!bot.IsConnectedAndLoggedOn) {
 				break;
-			}
-
-			try {
-				await ApplyRandomStateAsync(bot).ConfigureAwait(false);
-			} catch (Exception e) {
-				ASF.ArchiLogger.LogGenericException(e);
 			}
 		}
 	}
 
+	private static async Task<bool> DelayUntilAsync(DateTime until, CancellationToken cancellationToken) {
+		TimeSpan delay = until - DateTime.UtcNow;
+
+		if (delay > TimeSpan.Zero) {
+			try {
+				await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+			} catch (OperationCanceledException) {
+				return false;
+			}
+		}
+
+		return !cancellationToken.IsCancellationRequested;
+	}
+
 	private static bool RollOffline() => Random.Shared.NextDouble() < OfflineWeight;
 
-	// Only meaningful when RollOffline() returned false; splits the remaining (online) time between main game / idle / random game
 	private static OnlineSubState RollOnlineSubState() {
 		double roll = Random.Shared.NextDouble();
 
@@ -174,33 +234,21 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 		return roll < MainGameWeight + IdleWeight ? OnlineSubState.Idle : OnlineSubState.RandomGame;
 	}
 
-	private async Task ApplyRandomStateAsync(Bot bot) {
-		if (RollOffline()) {
-			bot.SteamFriends.SetPersonaState(EPersonaState.Invisible);
-			StopSimulatedPlay(bot);
-
-			bot.ArchiLogger.LogGenericInfo("Randomly went invisible (simulating offline).");
-
-			return;
-		}
+	private async Task ApplyOnlineSubStateAsync(Bot bot) {
+		bot.SteamFriends.SetPersonaState(EPersonaState.Online);
 
 		switch (RollOnlineSubState()) {
 			case OnlineSubState.Idle:
-				bot.SteamFriends.SetPersonaState(EPersonaState.Online);
 				StopSimulatedPlay(bot);
 
-				bot.ArchiLogger.LogGenericInfo("Randomly went online with no game.");
+				bot.ArchiLogger.LogGenericInfo("Randomly online with no game.");
 
 				break;
 			case OnlineSubState.MainGame:
-				bot.SteamFriends.SetPersonaState(EPersonaState.Online);
-
 				await TryPlaySimulatedGameAsync(bot, true).ConfigureAwait(false);
 
 				break;
 			case OnlineSubState.RandomGame:
-				bot.SteamFriends.SetPersonaState(EPersonaState.Online);
-
 				await TryPlaySimulatedGameAsync(bot, false).ConfigureAwait(false);
 
 				break;

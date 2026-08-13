@@ -90,13 +90,11 @@ internal sealed class RandomOnlineStatus : IASF, IBotConnection, IGitHubPluginUp
 		return Task.CompletedTask;
 	}
 
-	public Task OnBotDisconnected(Bot bot, EResult reason) {
+	public async Task OnBotDisconnected(Bot bot, EResult reason) {
 		if (BotLoops.TryRemove(bot.BotName, out CancellationTokenSource? cts)) {
-			cts.Cancel();
+			await cts.CancelAsync().ConfigureAwait(false);
 			cts.Dispose();
 		}
-
-		return Task.CompletedTask;
 	}
 
 	public Task OnBotLoggedOn(Bot bot) {
